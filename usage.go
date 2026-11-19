@@ -60,7 +60,6 @@ func (s *sampler) cpu() float64 {
 			s.cpuPercent = host[0]
 		}
 	case !s.lastAt.IsZero() && s.lastCPU >= 0:
-
 		pct := (current - s.lastCPU) / (now.Sub(s.lastAt).Seconds() * cpuCores()) * 100
 		s.cpuPercent = min(max(pct, 0), 100)
 	}
@@ -98,7 +97,6 @@ func memory() (used, total uint64) {
 	if err != nil {
 		return used, total
 	}
-
 	for _, line := range strings.Split(readCgroup("memory.stat"), "\n") {
 		if v, ok := strings.CutPrefix(line, "inactive_file "); ok {
 			if inactive, err := strconv.ParseUint(v, 10, 64); err == nil && inactive < current {

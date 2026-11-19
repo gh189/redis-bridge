@@ -20,6 +20,10 @@ const (
 	whyPubSub = "GET the channels or patterns endpoint (Server-Sent Events)"
 	whyConn   = "it changes connection state, which does not exist over HTTP"
 	whyAdmin  = "server administration commands are disabled"
+
+	whyWsTx      = "put the commands in the multi field of one message"
+	whyWsConn    = "it changes connection state, and WebSocket commands share Redis connections"
+	whyWsSharded = "sharded Pub/Sub is not supported; use SUBSCRIBE"
 )
 
 var stateful = map[string]string{
@@ -30,6 +34,13 @@ var stateful = map[string]string{
 	"CLIENT": whyConn, "MONITOR": whyConn, "SYNC": whyConn, "PSYNC": whyConn,
 }
 
+var wsStateful = map[string]string{
+	"MULTI": whyWsTx, "EXEC": whyWsTx, "DISCARD": whyWsTx, "WATCH": whyWsTx, "UNWATCH": whyWsTx,
+	"SSUBSCRIBE": whyWsSharded, "SUNSUBSCRIBE": whyWsSharded,
+	"SELECT": whyWsConn, "AUTH": whyWsConn, "HELLO": whyWsConn, "QUIT": whyWsConn, "RESET": whyWsConn,
+	"CLIENT": whyWsConn, "MONITOR": whyWsConn, "SYNC": whyWsConn, "PSYNC": whyWsConn,
+}
+
 var admin = map[string]bool{
 	"SHUTDOWN": true, "REPLICAOF": true, "SLAVEOF": true, "FAILOVER": true,
 	"SAVE": true, "BGSAVE": true, "BGREWRITEAOF": true,
@@ -37,20 +48,23 @@ var admin = map[string]bool{
 }
 
 func (b *Bridge) checkCommand(args []any) error {
+	return b.check(args, "HTTP", stateful)
+}
+
+func (b *Bridge) check(args []any, api string, rejected map[string]string) error {
 	if len(args) == 0 {
 		return errors.New("ERR empty command")
 	}
 	name := strings.ToUpper(args[0].(string))
-	if why, ok := stateful[name]; ok {
-		return fmt.Errorf("ERR command '%s' is not available over HTTP: %s", name, why)
+	if why, ok := rejected[name]; ok {
+		return fmt.Errorf("ERR command '%s' is not available over %s: %s", name, api, why)
 	}
 	if b.opts.AllowAdminCommands {
 		return nil
 	}
-
 	configWrite := name == "CONFIG" && (len(args) < 2 || !strings.EqualFold(args[1].(string), "GET"))
 	if admin[name] || configWrite {
-		return fmt.Errorf("ERR command '%s' is not available over HTTP: %s", name, whyAdmin)
+		return fmt.Errorf("ERR command '%s' is not available over %s: %s", name, api, whyAdmin)
 	}
 	return nil
 }
@@ -107,7 +121,6 @@ func (b *Bridge) serveKey(w http.ResponseWriter, r *http.Request, key string) {
 		value, err := b.run(r.Context(), "GET", key)
 		switch {
 		case err == nil && value == nil:
-
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "ERR no such key"})
 		case err != nil && strings.HasPrefix(err.Error(), "WRONGTYPE"):
 			b.fail(w, http.StatusBadRequest, "WRONGTYPE the key does not hold a string; POST the command for its type instead")
@@ -197,14 +210,7 @@ func (b *Bridge) runBatch(w http.ResponseWriter, r *http.Request, atomic bool) {
 	if !b.decodeBody(w, r, &raw) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), b.opts.CommandTimeout)
-	defer cancel()
-
-	pipe := b.rdb.Pipeline()
-	if atomic {
-		pipe = b.rdb.TxPipeline()
-	}
-	cmds := make([]*redis.Cmd, 0, len(raw))
+	batch := make([][]any, len(raw))
 	for i, item := range raw {
 		args, err := toArgs(item)
 		if err == nil {
@@ -214,11 +220,31 @@ func (b *Bridge) runBatch(w http.ResponseWriter, r *http.Request, atomic bool) {
 			b.fail(w, http.StatusBadRequest, fmt.Sprintf("%s (command #%d)", err, i+1))
 			return
 		}
-		cmds = append(cmds, pipe.Do(ctx, args...))
+		batch[i] = args
 	}
-	if len(cmds) == 0 {
-		writeJSON(w, http.StatusOK, []any{})
+	out, err := b.execBatch(r.Context(), batch, atomic, wantBase64(r))
+	if err != nil {
+		b.fail(w, errorStatus(err), err.Error())
 		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (b *Bridge) execBatch(ctx context.Context, batch [][]any, atomic, b64 bool) ([]map[string]any, error) {
+	out := make([]map[string]any, len(batch))
+	if len(batch) == 0 {
+		return out, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, b.opts.CommandTimeout)
+	defer cancel()
+
+	pipe := b.rdb.Pipeline()
+	if atomic {
+		pipe = b.rdb.TxPipeline()
+	}
+	cmds := make([]*redis.Cmd, len(batch))
+	for i, args := range batch {
+		cmds[i] = pipe.Do(ctx, args...)
 	}
 
 	b.commands.Add(int64(len(cmds)))
@@ -226,12 +252,9 @@ func (b *Bridge) runBatch(w http.ResponseWriter, r *http.Request, atomic bool) {
 		var replyErr redis.Error
 		aborted := atomic && strings.HasPrefix(err.Error(), "EXECABORT")
 		if !errors.As(err, &replyErr) && !errors.Is(err, redis.Nil) || aborted {
-			b.fail(w, errorStatus(err), err.Error())
-			return
+			return nil, err
 		}
 	}
-	b64 := wantBase64(r)
-	out := make([]map[string]any, len(cmds))
 	for i, cmd := range cmds {
 		value, err := cmd.Result()
 		if err != nil && !errors.Is(err, redis.Nil) {
@@ -241,7 +264,7 @@ func (b *Bridge) runBatch(w http.ResponseWriter, r *http.Request, atomic bool) {
 			out[i] = map[string]any{"result": encodeReply(value, b64)}
 		}
 	}
-	writeJSON(w, http.StatusOK, out)
+	return out, nil
 }
 
 func (b *Bridge) subscribe(w http.ResponseWriter, r *http.Request, pattern bool, channel string) {

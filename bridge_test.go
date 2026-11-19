@@ -226,7 +226,6 @@ func TestAuth(t *testing.T) {
 	expect(t, code, body, 200, `{"result":"OK"}`)
 	code, body = do(t, "GET", u+"?_token=s3cret", "")
 	expect(t, code, body, 200, `{"result":"v"}`)
-
 	code, _ = do(t, "GET", srv.URL+"/healthz", "")
 	expect(t, code, "", 200, "")
 }

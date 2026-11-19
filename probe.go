@@ -19,9 +19,8 @@ type Status struct {
 }
 
 type RedisStatus struct {
-	Info map[string]map[string]string `json:"info,omitempty"`
-
-	Error string `json:"error,omitempty"`
+	Info  map[string]map[string]string `json:"info,omitempty"`
+	Error string                       `json:"error,omitempty"`
 }
 
 func (b *Bridge) Ready(ctx context.Context) bool {

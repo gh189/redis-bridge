@@ -12,15 +12,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 type Options struct {
-	AuthToken string
-
-	CommandTimeout time.Duration
-
-	MaxBodyBytes int64
-
+	AuthToken          string
+	CommandTimeout     time.Duration
+	MaxBodyBytes       int64
 	AllowAdminCommands bool
 }
 

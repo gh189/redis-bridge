@@ -90,8 +90,8 @@ func TestWebSocket(t *testing.T) {
 	c.ask(`{"id":5,"cmd":["LRANGE","none",0,-1]}`, `{"id":5,"result":[]}`)
 
 	c.ask(`{"id":6,"cmd":["INCR","greeting"]}`, `{"id":6,"error":"ERR value is not an integer or out of range"}`)
-	c.ask(`{"id":7,"cmd":["MULTI"]}`, `{"id":7,"error":"ERR command 'MULTI' is not available over HTTP: `+whyTx+`"}`)
-	c.ask(`{"id":8,"cmd":["BGSAVE"]}`, `{"id":8,"error":"ERR command 'BGSAVE' is not available over HTTP: `+whyAdmin+`"}`)
+	c.ask(`{"id":7,"cmd":["SELECT",1]}`, `{"id":7,"error":"ERR command 'SELECT' is not available over WebSocket: `+whyWsConn+`"}`)
+	c.ask(`{"id":8,"cmd":["BGSAVE"]}`, `{"id":8,"error":"ERR command 'BGSAVE' is not available over WebSocket: `+whyAdmin+`"}`)
 	c.ask(`{"id":9}`, `{"id":9,"error":"ERR empty command"}`)
 	c.ask(`{"id":10,"cmd":["GET",["k"]]}`, `{"id":10,"error":"ERR argument #2 must be a string, number or boolean"}`)
 	c.send(`nope`)
@@ -182,6 +182,89 @@ func TestWebSocketBlocking(t *testing.T) {
 	}
 }
 
+func TestWebSocketTransaction(t *testing.T) {
+	srv, _, _ := newTestServer(t, Options{})
+	c, _ := wsDial(t, wsURL(srv.URL, ""))
+
+	c.ask(`{"id":1,"multi":[["SET","n",1],["INCR","n"],["LPUSH","n","x"]]}`,
+		`{"id":1,"result":[{"result":"OK"},{"result":2},{"error":"WRONGTYPE Operation against a key holding the wrong kind of value"}]}`)
+	c.ask(`{"id":2,"multi":[]}`, `{"id":2,"result":[]}`)
+
+	c.send(`{"id":3,"cmd":["SET","n",10]}`, `{"id":4,"multi":[["INCR","n"],["INCR","n"]]}`, `{"id":5,"cmd":["GET","n"]}`)
+	for _, want := range []string{`{"id":3,"result":"OK"}`, `{"id":4,"result":[{"result":11},{"result":12}]}`, `{"id":5,"result":"12"}`} {
+		if got, err := c.recv(); got != want {
+			t.Errorf("got %s (%v), want %s", got, err, want)
+		}
+	}
+
+	c.ask(`{"id":6,"multi":[["INCR","n"],["SET","x"]]}`, `{"id":6,"error":"EXECABORT Transaction discarded because of previous errors."}`)
+	c.ask(`{"id":7,"cmd":["GET","n"]}`, `{"id":7,"result":"12"}`)
+
+	c.ask(`{"id":8,"cmd":["MULTI"]}`, `{"id":8,"error":"ERR command 'MULTI' is not available over WebSocket: `+whyWsTx+`"}`)
+	c.ask(`{"id":9,"multi":[["INCR","n"],["WATCH","n"]]}`,
+		`{"id":9,"error":"ERR command 'WATCH' is not available over WebSocket: `+whyWsTx+` (command #2)"}`)
+	c.ask(`{"id":10,"multi":[["SUBSCRIBE","ch"]]}`, `{"id":10,"error":"ERR command 'SUBSCRIBE' is not available in a transaction (command #1)"}`)
+	c.ask(`{"id":11,"multi":[["INCR",["n"]]]}`, `{"id":11,"error":"ERR argument #2 must be a string, number or boolean (command #1)"}`)
+	c.ask(`{"id":12,"cmd":["GET","n"],"multi":[["GET","n"]]}`, `{"id":12,"error":"ERR a message has \"cmd\" or \"multi\", not both"}`)
+	c.ask(`{"id":13,"cmd":["GET","n"]}`, `{"id":13,"result":"12"}`)
+}
+
+func TestWebSocketSubscribe(t *testing.T) {
+	srv, b, _ := newTestServer(t, Options{})
+	c, _ := wsDial(t, wsURL(srv.URL, ""))
+	publish := func(channel, msg string, receivers int) {
+		t.Helper()
+		code, body := do(t, "POST", srv.URL+"/redis/channels/"+channel, msg)
+		expect(t, code, body, 200, fmt.Sprintf(`{"result":%d}`, receivers))
+	}
+
+	c.ask(`{"id":1,"cmd":["UNSUBSCRIBE"]}`, `{"id":1,"result":0}`)
+	c.ask(`{"id":2,"cmd":["SUBSCRIBE"]}`, `{"id":2,"error":"ERR wrong number of arguments for 'subscribe' command"}`)
+	c.ask(`{"id":3,"cmd":["SUBSCRIBE","news","alerts"]}`, `{"id":3,"result":2}`)
+	c.ask(`{"id":4,"cmd":["psubscribe","news.*"]}`, `{"id":4,"result":3}`)
+	if st := b.Stats(); st.Subscribers != 1 {
+		t.Errorf("subscribers = %d, want 1", st.Subscribers)
+	}
+
+	publish("news", "line1\nline2", 1)
+	if got, _ := c.recv(); got != `{"push":"message","channel":"news","data":"line1\nline2"}` {
+		t.Errorf("message = %s", got)
+	}
+	c.send(`{"id":5,"cmd":["SUBSCRIBE","jobs"]}`, `{"id":6,"cmd":["PUBLISH","jobs","j1"]}`, `{"id":7,"cmd":["PUBLISH","news.tech","hi"]}`)
+	want := map[string]bool{
+		`{"id":5,"result":4}`:                             true,
+		`{"id":6,"result":1}`:                             true,
+		`{"id":7,"result":1}`:                             true,
+		`{"push":"message","channel":"jobs","data":"j1"}`: true,
+		`{"push":"pmessage","pattern":"news.*","channel":"news.tech","data":"hi"}`: true,
+	}
+	for range len(want) {
+		got, err := c.recv()
+		if !want[got] {
+			t.Errorf("unexpected %s (%v)", got, err)
+		}
+		delete(want, got)
+	}
+
+	c.ask(`{"id":8,"cmd":["UNSUBSCRIBE","news","nope"]}`, `{"id":8,"result":3}`)
+	publish("news", "gone", 0)
+	c.ask(`{"id":9,"cmd":["UNSUBSCRIBE"]}`, `{"id":9,"result":1}`)
+	c.ask(`{"id":10,"cmd":["PUNSUBSCRIBE"]}`, `{"id":10,"result":0}`)
+	publish("news.tech", "gone", 0)
+	c.ask(`{"id":11,"cmd":["SSUBSCRIBE","news"]}`, `{"id":11,"error":"ERR command 'SSUBSCRIBE' is not available over WebSocket: `+whyWsSharded+`"}`)
+
+	c64, _ := wsDial(t, wsURL(srv.URL, "?encoding=base64"))
+	c64.ask(`{"id":1,"cmd":["SUBSCRIBE","news"]}`, `{"id":1,"result":1}`)
+	publish("news", "hello", 1)
+	if got, _ := c64.recv(); got != `{"push":"message","channel":"news","data":"aGVsbG8="}` {
+		t.Errorf("base64 message = %s", got)
+	}
+
+	c.conn.Close()
+	c64.conn.Close()
+	waitFor(t, "the subscriptions to be released", func() bool { return b.Stats().Subscribers == 0 })
+}
+
 func TestIsBlocking(t *testing.T) {
 	cases := map[string]bool{
 		"BLPOP q 0":                                true,
@@ -235,7 +318,6 @@ func TestWebSocketAuth(t *testing.T) {
 	}
 	c, _ := wsDial(t, wsURL(srv.URL, ""), "Authorization", "Bearer s3cret")
 	c.ask(`{"id":1,"cmd":["PING"]}`, `{"id":1,"result":"PONG"}`)
-
 	c, _ = wsDial(t, wsURL(srv.URL, "?_token=s3cret"), "Origin", "http://app.example")
 	c.ask(`{"id":2,"cmd":["PING"]}`, `{"id":2,"result":"PONG"}`)
 }
@@ -258,8 +340,8 @@ func TestWebSocketRedisDown(t *testing.T) {
 	c, _ := wsDial(t, wsURL(srv.URL, ""))
 	mr.Close()
 
-	c.send(`{"id":1,"cmd":["GET","k"]}`, `{"id":2,"cmd":["GET","k"]}`)
-	for i := 1; i <= 2; i++ {
+	c.send(`{"id":1,"cmd":["GET","k"]}`, `{"id":2,"cmd":["GET","k"]}`, `{"id":3,"cmd":["SUBSCRIBE","news"]}`)
+	for i := 1; i <= 3; i++ {
 		if got, err := c.recv(); !strings.HasPrefix(got, fmt.Sprintf(`{"id":%d,"error":"`, i)) {
 			t.Errorf("reply #%d: got %s (%v), want an error", i, got, err)
 		}
@@ -269,7 +351,7 @@ func TestWebSocketRedisDown(t *testing.T) {
 func TestWebSocketClose(t *testing.T) {
 	srv, b, _ := newTestServer(t, Options{})
 	c, _ := wsDial(t, wsURL(srv.URL, ""))
-	c.ask(`{"id":1,"cmd":["PING"]}`, `{"id":1,"result":"PONG"}`)
+	c.ask(`{"id":1,"cmd":["SUBSCRIBE","news"]}`, `{"id":1,"result":1}`)
 
 	b.Close()
 	_, err := c.recv()
@@ -277,5 +359,8 @@ func TestWebSocketClose(t *testing.T) {
 	if !errors.As(err, &closed) || closed.Code != ws.StatusGoingAway {
 		t.Errorf("got %v, want close code %d", err, ws.StatusGoingAway)
 	}
-	waitFor(t, "the connection to be released", func() bool { return b.Stats().WebSockets == 0 })
+	waitFor(t, "the connection to be released", func() bool {
+		st := b.Stats()
+		return st.WebSockets == 0 && st.Subscribers == 0
+	})
 }
